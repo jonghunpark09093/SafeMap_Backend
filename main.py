@@ -3,7 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import psycopg2  # 👈 파이썬아, 아까 설치한 배달부 좀 불러와! (이 줄이 핵심입니다)
 from pydantic import BaseModel #👈 데이터 모델을 정의하기 위한 도구
 from typing import List  # 👈 리스트 형태를 명시하기 위한 도구
+import os
+from fastapi import HTTPException
+from dotenv import load_dotenv
 
+load_dotenv()
 
 app = FastAPI()
 
@@ -54,7 +58,7 @@ def calculate_safe_route_mock(start_lat, start_lng, end_lat, end_lng, persona):
         "path": fake_path
     }
 
-# 🧠 페르소나별 맞춤형 가중치(비용) 계산 공식 뱉어주는 함수
+# 페르소나별 맞춤형 가중치(비용) 계산 공식 뱉어주는 함수
 def get_cost_query_by_persona(persona: str):
     """
     이 함수는 DB에게 '어떤 기준으로 길의 비용(cost)을 계산할지'
@@ -86,10 +90,11 @@ def test_db_connection():
     try:
         # DB(냉장고) 문 열기 
         conn = psycopg2.connect(
-            host="localhost",
-            port="5433",            dbname="postgres" ,
-            user="postgres",
-            password="whdgnspark28@"
+            host=os.getenv("DB_HOST"),
+            port=os.getenv("DB_PORT"),
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD")
         )
         cursor = conn.cursor()
         cursor.execute("SELECT count(*) FROM nodes;")
@@ -107,25 +112,30 @@ def test_db_connection():
     except Exception as e:
         return {"status": "DB 연결 실패...", "error": str(e)}
 
-# 프론트엔드가 길 찾기를 요청할 API 주소.
-@app.post("/api/route", response_model=RouteResponse)   
+#=============== api 반환 ===================
+# 프론트엔드가 길 찾기를 요청할 API 주소 (합체본)
+@app.post("/api/route", response_model=RouteResponse)
 def get_safe_route(request: RouteRequest):
+    
+    # 방어벽 1: 한국(서울) 좌표가 맞는지 대략적인 검사
+    # 위도가 37.4 ~ 37.7 사이, 경도가 126.7 ~ 127.2 사이를 벗어나면 쳐내기
+    if not (37.4 < request.start_lat < 37.7) or not (126.7 < request.start_lng < 127.2):
+        # 400 에러(니가 잘못 보냈어!)와 함께 호통치기
+        raise HTTPException(status_code=400, detail="지원하지 않는 지역입니다. 서울 내에서만 출발/도착이 가능합니다.")
+        
+    # 1. 방어벽을 무사히 통과했다면, 가짜 알고리즘 실행
+    result = calculate_safe_route_mock(
+        start_lat=request.start_lat,
+        start_lng=request.start_lng,
+        end_lat=request.end_lat,
+        end_lng=request.end_lng,
+        persona=request.persona
+    )
 
-        # 1. 방금 만든 알고리즘 뼈대 함수에 프론트엔드가 준 데이터를 집어넣기.
-        result = calculate_safe_route_mock(
-            start_lat=request.start_lat,
-            start_lng=request.start_lng,
-            end_lat=request.end_lat,
-            end_lng=request.end_lng,
-            persona=request.persona
-        )
-
-        # 2. 약속한 RouteResponse 모양에 맞게 데이터를 가공해서 프론트엔드에게 돌려주기.
-        return RouteResponse(
-            status="success",
-            total_distance=result["distance"],
-            total_danger_score=result["danger_score"],  
-            path=result["path"]
-        )
-
-
+    # 2. 약속한 RouteResponse 모양에 맞게 데이터를 가공해서 프론트엔드에게 돌려주기
+    return RouteResponse(
+        status="success",
+        total_distance=result["distance"],
+        total_danger_score=result["danger_score"],  
+        path=result["path"]
+    )
