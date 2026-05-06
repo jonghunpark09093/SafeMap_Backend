@@ -1,4 +1,15 @@
-.venv/
-__pycache__/
-*.pyc
+
+# 환경변수 
 .env
+
+# 파이썬 캐시 파일
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 가상환경 폴더 
+venv/
+env/
+
+# Mac OS 숨김 파일 
+.DS_Store
