@@ -130,10 +130,10 @@ def get_safe_path(request: RouteRequest):
 
         light_msg = ""
         if avg_led <= 0.3: light_msg += "가로등이 촘촘하게 설치되어 있으며, "
-        else: light_msg += "가로등 배치가 다소 드문 구간이 포함되어 있으나, "
+        else: light_msg += "가로등 배치가 다소 드문 구간이 포함되어 있으며, "
 
         if avg_sdot <= 0.3: light_msg += f"{request.request_hour}시 현재 실제 측정 조도가 매우 밝습니다."
-        else: light_msg += f"{request.request_hour}시 현재 센서 조도가 다소 낮아 야간 보행 시 주의가 필요합니다."
+        else: light_msg += f"{request.request_hour}시 현재 센서 조도가 다소 낮아 보행 시 주의가 필요합니다."
         insights.append(light_msg)
 
         if avg_sec <= 0.4: insights.append("CCTV 밀집 구역을 우선 경유합니다.")
@@ -169,3 +169,5 @@ def get_safe_path(request: RouteRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+        
