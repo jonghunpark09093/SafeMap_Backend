@@ -169,5 +169,50 @@ def get_safe_path(request: RouteRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
 
-        
+@app.get("/api/map/cctv")
+def get_cctv_locations(lat: float = None, lng: float = None, radius: float = 1000):
+    """
+    프론트엔드 지도에 표시할 CCTV 위치 데이터를 반환하는 엔드포인트
+    lat, lng, radius(미터) 파라미터로 반경 필터링 가능
+    """
+    try:
+        if lat is not None and lng is not None:
+            # 좌표가 있으면 반경 내 CCTV만 조회
+            query = text("""
+                SELECT 
+                    id, 
+                    latitude AS lat, 
+                    longitude AS lng 
+                FROM cctv_cameras
+                WHERE ST_DWithin(
+                    geom,
+                    ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
+                    :radius
+                )
+                LIMIT 50
+            """)
+            params = {"lat": lat, "lng": lng, "radius": radius}
+        else:
+            # 좌표 없으면 전체 반환 (기존 동작 유지)
+            query = text("""
+                SELECT id, latitude AS lat, longitude AS lng
+                FROM cctv_cameras
+            """)
+            params = {}
+
+        with engine.connect() as conn:
+            result = conn.execute(query, params).fetchall()
+            cctv_list = [
+                {"id": row[0], "lat": row[1], "lng": row[2]}
+                for row in result
+            ]
+
+        return {
+            "status": "success",
+            "count": len(cctv_list),
+            "data": cctv_list
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CCTV 데이터 조회 오류: {str(e)}")
