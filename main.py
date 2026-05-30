@@ -1,5 +1,4 @@
 import os
-import json
 import re
 from typing import List, Dict
 from dotenv import load_dotenv
@@ -53,6 +52,7 @@ def get_safe_path(request: RouteRequest):
         "senior":  {"sec": 1.0, "led": 1.2, "sdot": 1.2, "slp": 5.0, "civ": 1.5, "flow": 1.0}
     }
     w = weights.get(request.persona.lower(), weights["general"])
+    w_sum = w["sec"] + w["led"] + w["sdot"] + w["slp"] + w["civ"] + w["flow"]
 
     try:
         query = text("""
@@ -65,18 +65,18 @@ def get_safe_path(request: RouteRequest):
             ORDER BY the_geom <-> ST_SetSRID(ST_MakePoint(:end_lng, :end_lat), 4326) LIMIT 1
         ),
         path_edges AS (
-            SELECT p.edge, r.geometry, r.security_risk_score, r.led_risk_score, r.slope_risk_score, r.civil_risk_score, r.flow_risk_score, r.length,
+            SELECT p.seq, p.edge, r.geometry, r.security_risk_score, r.led_risk_score, r.slope_risk_score, r.civil_risk_score, r.flow_risk_score, r.length,
                    COALESCE(s.light_risk, 0.5) AS sdot_risk_score
             FROM pgr_dijkstra(
-                'SELECT r.id, r.source, r.target, 
-                    (r.length * (1 + 
-                        r.security_risk_score * :w_sec + 
-                        r.led_risk_score * :w_led + 
-                        COALESCE(s.light_risk, 0.5) * :w_sdot + 
+                'SELECT r.id, r.source, r.target,
+                    (r.length * (1 +
+                        r.security_risk_score * :w_sec +
+                        r.led_risk_score * :w_led +
+                        COALESCE(s.light_risk, 0.5) * :w_sdot +
                         r.slope_risk_score * :w_slp +
                         r.civil_risk_score * :w_civ +
-                        r.flow_risk_score * :w_flow 
-                    )) AS cost 
+                        r.flow_risk_score * :w_flow
+                    )) AS cost
                  FROM road_links r
                  LEFT JOIN sdot_light s ON r.nearest_sdot_id = s.sensor_id AND s.hour = :req_hour',
                 (SELECT id FROM start_node),
@@ -87,22 +87,71 @@ def get_safe_path(request: RouteRequest):
             LEFT JOIN sdot_light s ON r.nearest_sdot_id = s.sensor_id AND s.hour = :req_hour
             WHERE p.edge > 0
         ),
+        edge_features AS (
+            SELECT *,
+                CASE
+                    WHEN edge_risk < 0.52 THEN 'safe'
+                    WHEN edge_risk < 0.64 THEN 'caution'
+                    WHEN edge_risk < 0.78 THEN 'warning'
+                    ELSE 'danger'
+                END AS risk_level,
+                CASE
+                    WHEN c_max = c_sec  THEN 'security'
+                    WHEN c_max = c_led  THEN 'led'
+                    WHEN c_max = c_sdot THEN 'sdot'
+                    WHEN c_max = c_slp  THEN 'slope'
+                    WHEN c_max = c_civ  THEN 'civil'
+                    ELSE 'flow'
+                END AS dominant_factor,
+                c_max / NULLIF(c_sec + c_led + c_sdot + c_slp + c_civ + c_flow, 0) AS dominant_ratio
+            FROM (
+                SELECT *,
+                    security_risk_score * :w_sec AS c_sec,
+                    led_risk_score * :w_led AS c_led,
+                    sdot_risk_score * :w_sdot AS c_sdot,
+                    slope_risk_score * :w_slp AS c_slp,
+                    civil_risk_score * :w_civ AS c_civ,
+                    flow_risk_score * :w_flow AS c_flow,
+                    GREATEST(
+                        security_risk_score * :w_sec, led_risk_score * :w_led, sdot_risk_score * :w_sdot,
+                        slope_risk_score * :w_slp, civil_risk_score * :w_civ, flow_risk_score * :w_flow
+                    ) AS c_max,
+                    (security_risk_score * :w_sec
+                     + led_risk_score * :w_led
+                     + sdot_risk_score * :w_sdot
+                     + slope_risk_score * :w_slp
+                     + civil_risk_score * :w_civ
+                     + flow_risk_score * :w_flow) / :w_sum AS edge_risk
+                FROM path_edges
+            ) scored
+        ),
         nearby_risks AS (
             SELECT DISTINCT c.category, c.contents, ST_Y(c.geometry::geometry) AS lat, ST_X(c.geometry::geometry) AS lng
             FROM civil_risk_points c
             JOIN path_edges e ON ST_DWithin(c.geometry::geography, e.geometry::geography, 20)
         )
-        SELECT 
-            ST_AsGeoJSON(ST_LineMerge(ST_Union(e.geometry))) AS route_geojson,
+        SELECT
+            (SELECT COALESCE(json_agg(json_build_object(
+                'type', 'Feature',
+                'geometry', ST_AsGeoJSON(geometry)::json,
+                'properties', json_build_object(
+                    'seq', seq,
+                    'edge_risk', round(edge_risk::numeric, 3),
+                    'risk_level', risk_level,
+                    'dominant_factor', dominant_factor,
+                    'dominant_ratio', round(dominant_ratio::numeric, 3),
+                    'length', round(length::numeric, 2)
+                )
+            ) ORDER BY seq), '[]') FROM edge_features) AS features,
             SUM(e.length) AS total_distance,
             COALESCE(SUM(e.security_risk_score * e.length) / NULLIF(SUM(e.length), 0), 0) AS avg_sec,
             COALESCE(SUM(e.led_risk_score * e.length) / NULLIF(SUM(e.length), 0), 0) AS avg_led,
             COALESCE(SUM(e.sdot_risk_score * e.length) / NULLIF(SUM(e.length), 0), 0) AS avg_sdot,
             COALESCE(SUM(e.slope_risk_score * e.length) / NULLIF(SUM(e.length), 0), 0) AS avg_slp,
             COALESCE(SUM(e.civil_risk_score * e.length) / NULLIF(SUM(e.length), 0), 0) AS avg_civ,
-            COALESCE(SUM(e.flow_risk_score * e.length) / NULLIF(SUM(e.length), 0), 0) AS avg_flow, -- ⭐️ 추출!
+            COALESCE(SUM(e.flow_risk_score * e.length) / NULLIF(SUM(e.length), 0), 0) AS avg_flow,
             (SELECT COALESCE(json_agg(json_build_object('type', category, 'detail', contents, 'lat', lat, 'lng', lng)), '[]') FROM nearby_risks) AS detected_points
-        FROM path_edges e;
+        FROM edge_features e;
         """)
 
         with engine.connect() as conn:
@@ -111,13 +160,14 @@ def get_safe_path(request: RouteRequest):
                 "end_lng": request.end_lng, "end_lat": request.end_lat,
                 "req_hour": request.request_hour,
                 "w_sec": w["sec"], "w_led": w["led"], "w_sdot": w["sdot"], "w_slp": w["slp"], "w_civ": w["civ"],
-                "w_flow": w["flow"] # 파라미터 바인딩 추가
+                "w_flow": w["flow"], "w_sum": w_sum
             }).fetchone()
 
         if not result or not result[0]:
             raise HTTPException(status_code=404, detail="경로를 찾을 수 없습니다.")
 
         # 데이터 파싱
+        features = result[0] or []
         dist = round(result[1], 2)
         # avg_flow 까지 6개의 위험도 추출
         avg_sec, avg_led, avg_sdot, avg_slp, avg_civ, avg_flow = [round(v, 3) for v in result[2:8]]
@@ -165,7 +215,7 @@ def get_safe_path(request: RouteRequest):
                 },
                 "markers": markers
             },
-            "geojson": {"type": "Feature", "geometry": json.loads(result[0])}
+            "geojson": {"type": "FeatureCollection", "features": features}
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
