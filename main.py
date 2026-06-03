@@ -140,6 +140,7 @@ def get_safe_path(request: RouteRequest):
                     'risk_level', risk_level,
                     'dominant_factor', dominant_factor,
                     'dominant_ratio', round(dominant_ratio::numeric, 3),
+                    'slope_risk', round(slope_risk_score::numeric, 3),
                     'length', round(length::numeric, 2)
                 )
             ) ORDER BY seq), '[]') FROM edge_features) AS features,

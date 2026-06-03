@@ -7,9 +7,17 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# 가상환경 폴더 
+# 가상환경 폴더
 venv/
 env/
+.venv/
 
-# Mac OS 숨김 파일 
+# Mac OS 숨김 파일
 .DS_Store
+
+# Claude Code 로컬 설정
+.claude/
+
+# 경사도 재처리 원본 데이터(용량 큼, 드라이브 보관) 및 중간 산출물
+slope_rework/data/
+slope_rework/*.npz
