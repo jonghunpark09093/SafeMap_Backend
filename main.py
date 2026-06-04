@@ -1,6 +1,6 @@
 import os
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException
@@ -36,7 +36,21 @@ class RouteRequest(BaseModel):
     end_lat: float
     end_lng: float
     persona: str
-    request_hour: int 
+    request_hour: int
+
+# 사용자 제보 유형 (피그마 디자인 7종)
+REPORT_CATEGORIES = [
+    "도로 파손", "어두운 골목", "가로등/조도 불량", "공사 중",
+    "CCTV 사각지대", "경사도", "기타",
+]
+
+class ReportRequest(BaseModel):
+    lat: float
+    lng: float
+    categories: List[str]          # 체크된 유형(복수 선택 가능)
+    intensity: int = 0             # 체감 위험 강도 0~8
+    memo: Optional[str] = None     # 한마디(선택)
+    etc_text: Optional[str] = None # '기타' 선택 시 직접 입력한 유형 문구
 
 def clean_text(text_data: str) -> str:
     if not text_data: return ""
@@ -267,3 +281,92 @@ def get_cctv_locations(lat: float = None, lng: float = None, radius: float = 100
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"CCTV 데이터 조회 오류: {str(e)}")
+
+
+@app.post("/api/reports")
+def create_report(report: ReportRequest):
+    """
+    사용자 위험 제보 등록 (실시간 DB 반영).
+    ※ 신뢰도 검증 문제로 위험도(라우팅) 계산에는 반영하지 않고,
+       지도 별도 마커 + 경로 참고정보로만 사용한다.
+    """
+    # 유형 검증: 허용된 7종만, 빈 값 제거
+    cats = [c.strip() for c in report.categories if c and c.strip()]
+    invalid = [c for c in cats if c not in REPORT_CATEGORIES]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"허용되지 않은 제보 유형: {invalid}")
+    if not cats:
+        raise HTTPException(status_code=400, detail="제보 유형을 1개 이상 선택해주세요.")
+
+    intensity = max(0, min(8, int(report.intensity)))  # 0~8 범위 보호
+    memo = clean_text(report.memo) if report.memo else None
+    # '기타' 직접 입력 문구: '기타'를 선택했을 때만 의미가 있음
+    etc_text = clean_text(report.etc_text) if report.etc_text else None
+    if "기타" not in cats:
+        etc_text = None
+
+    try:
+        query = text("""
+            INSERT INTO user_reports (geom, categories, intensity, memo, etc_text)
+            VALUES (ST_SetSRID(ST_MakePoint(:lng, :lat), 4326), :cats, :intensity, :memo, :etc_text)
+            RETURNING id, ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                      categories, intensity, memo, etc_text, created_at
+        """)
+        with engine.begin() as conn:
+            row = conn.execute(query, {
+                "lng": report.lng, "lat": report.lat,
+                "cats": cats, "intensity": intensity, "memo": memo, "etc_text": etc_text,
+            }).fetchone()
+
+        return {
+            "status": "success",
+            "data": {
+                "id": row[0], "lat": row[1], "lng": row[2],
+                "categories": list(row[3]), "intensity": row[4],
+                "memo": row[5], "etc_text": row[6], "created_at": row[7].isoformat(),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"제보 등록 오류: {str(e)}")
+
+
+@app.get("/api/reports")
+def get_reports(lat: float = None, lng: float = None, radius: float = 1000, limit: int = 200):
+    """
+    지도 마커용 사용자 제보 조회.
+    lat/lng/radius(미터)로 반경 필터링, 없으면 최신순 전체(limit).
+    """
+    try:
+        if lat is not None and lng is not None:
+            query = text("""
+                SELECT id, ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                       categories, intensity, memo, etc_text, created_at
+                FROM user_reports
+                WHERE ST_DWithin(geom::geography,
+                                 ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography, :radius)
+                ORDER BY created_at DESC
+                LIMIT :limit
+            """)
+            params = {"lat": lat, "lng": lng, "radius": radius, "limit": limit}
+        else:
+            query = text("""
+                SELECT id, ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                       categories, intensity, memo, etc_text, created_at
+                FROM user_reports
+                ORDER BY created_at DESC
+                LIMIT :limit
+            """)
+            params = {"limit": limit}
+
+        with engine.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        data = [{
+            "id": r[0], "lat": r[1], "lng": r[2],
+            "categories": list(r[3]), "intensity": r[4],
+            "memo": r[5], "etc_text": r[6], "created_at": r[7].isoformat(),
+        } for r in rows]
+
+        return {"status": "success", "count": len(data), "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"제보 조회 오류: {str(e)}")
