@@ -3,7 +3,7 @@ import re
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
@@ -51,6 +51,19 @@ class ReportRequest(BaseModel):
     intensity: int = 0             # 체감 위험 강도 0~8
     memo: Optional[str] = None     # 한마디(선택)
     etc_text: Optional[str] = None # '기타' 선택 시 직접 입력한 유형 문구
+
+class ReportStatusRequest(BaseModel):
+    status: str                    # 'visible' | 'hidden'
+
+# 관리자(제보 감독) 키. 시연 편의를 위한 기본값이며, 운영 시 .env의 ADMIN_KEY로 override.
+ADMIN_KEY = os.getenv("ADMIN_KEY") or "safemap-admin-2026"
+
+def require_admin(x_admin_key: Optional[str]):
+    """관리자 키 검증. 헤더 X-Admin-Key 가 .env ADMIN_KEY 와 일치해야 통과."""
+    if not ADMIN_KEY:
+        raise HTTPException(status_code=500, detail="서버에 ADMIN_KEY가 설정되지 않았습니다.")
+    if x_admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="관리자 인증 실패")
 
 def clean_text(text_data: str) -> str:
     if not text_data: return ""
@@ -342,7 +355,8 @@ def get_reports(lat: float = None, lng: float = None, radius: float = 1000, limi
                 SELECT id, ST_Y(geom) AS lat, ST_X(geom) AS lng,
                        categories, intensity, memo, etc_text, created_at
                 FROM user_reports
-                WHERE ST_DWithin(geom::geography,
+                WHERE status = 'visible'
+                  AND ST_DWithin(geom::geography,
                                  ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography, :radius)
                 ORDER BY created_at DESC
                 LIMIT :limit
@@ -353,6 +367,7 @@ def get_reports(lat: float = None, lng: float = None, radius: float = 1000, limi
                 SELECT id, ST_Y(geom) AS lat, ST_X(geom) AS lng,
                        categories, intensity, memo, etc_text, created_at
                 FROM user_reports
+                WHERE status = 'visible'
                 ORDER BY created_at DESC
                 LIMIT :limit
             """)
@@ -370,3 +385,77 @@ def get_reports(lat: float = None, lng: float = None, radius: float = 1000, limi
         return {"status": "success", "count": len(data), "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"제보 조회 오류: {str(e)}")
+
+
+# ─────────────────────────────────────────────
+# 관리자(제보 감독) API — 모두 X-Admin-Key 헤더 필요
+#  · 신뢰도 낮은/부적절 제보를 숨김(소프트 삭제) 처리하거나 영구 삭제
+#  · 숨김 처리는 기록을 남겨 감사/복구가 가능 (위험도 계산엔 애초에 미반영)
+# ─────────────────────────────────────────────
+@app.get("/api/admin/reports")
+def admin_list_reports(x_admin_key: Optional[str] = Header(None), limit: int = 500):
+    """관리자용 전체 제보 목록 (숨김 포함). 최신순."""
+    require_admin(x_admin_key)
+    try:
+        query = text("""
+            SELECT id, ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                   categories, intensity, memo, etc_text, status, created_at
+            FROM user_reports
+            ORDER BY created_at DESC
+            LIMIT :limit
+        """)
+        with engine.connect() as conn:
+            rows = conn.execute(query, {"limit": limit}).fetchall()
+        data = [{
+            "id": r[0], "lat": r[1], "lng": r[2],
+            "categories": list(r[3]), "intensity": r[4],
+            "memo": r[5], "etc_text": r[6], "status": r[7],
+            "created_at": r[8].isoformat(),
+        } for r in rows]
+        return {"status": "success", "count": len(data), "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"관리자 조회 오류: {str(e)}")
+
+
+@app.patch("/api/admin/reports/{report_id}")
+def admin_set_report_status(report_id: int, body: ReportStatusRequest,
+                            x_admin_key: Optional[str] = Header(None)):
+    """제보 노출 상태 변경 (visible ↔ hidden). 소프트 삭제 = hidden."""
+    require_admin(x_admin_key)
+    new_status = (body.status or "").strip()
+    if new_status not in ("visible", "hidden"):
+        raise HTTPException(status_code=400, detail="status는 'visible' 또는 'hidden'만 가능합니다.")
+    try:
+        query = text("""
+            UPDATE user_reports SET status = :status
+            WHERE id = :id
+            RETURNING id, status
+        """)
+        with engine.begin() as conn:
+            row = conn.execute(query, {"status": new_status, "id": report_id}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="해당 제보를 찾을 수 없습니다.")
+        return {"status": "success", "data": {"id": row[0], "report_status": row[1]}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"상태 변경 오류: {str(e)}")
+
+
+@app.delete("/api/admin/reports/{report_id}")
+def admin_delete_report(report_id: int, x_admin_key: Optional[str] = Header(None)):
+    """제보 영구 삭제 (복구 불가). 스팸/악성 데이터 정리용."""
+    require_admin(x_admin_key)
+    try:
+        query = text("DELETE FROM user_reports WHERE id = :id RETURNING id")
+        with engine.begin() as conn:
+            row = conn.execute(query, {"id": report_id}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="해당 제보를 찾을 수 없습니다.")
+        return {"status": "success", "data": {"id": row[0], "deleted": True}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"삭제 오류: {str(e)}")
