@@ -30,6 +30,39 @@ db_url = URL.create(
 )
 engine = create_engine(db_url)
 
+
+def ensure_report_schema() -> None:
+    """user_reports 테이블/인덱스가 없으면 생성(idempotent).
+
+    로컬·신규 DB에서 서버를 바로 띄울 수 있게 보장한다. 운영/기존 DB에는
+    이미 존재하므로 CREATE ... IF NOT EXISTS 로 모두 no-op 처리된다.
+    스키마는 main.py가 실제 사용하는 쿼리와 1:1 일치(PostGIS geom · TEXT[] · status 기본값).
+    """
+    ddl = text("""
+        CREATE EXTENSION IF NOT EXISTS postgis;
+        CREATE TABLE IF NOT EXISTS user_reports (
+            id          SERIAL PRIMARY KEY,
+            geom        geometry(Point, 4326) NOT NULL,
+            categories  TEXT[]      NOT NULL DEFAULT '{}',
+            intensity   INTEGER     NOT NULL DEFAULT 0,
+            memo        TEXT,
+            etc_text    TEXT,
+            status      TEXT        NOT NULL DEFAULT 'visible',
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_reports_geom   ON user_reports USING GIST (geom);
+        CREATE INDEX IF NOT EXISTS idx_user_reports_status ON user_reports (status);
+    """)
+    with engine.begin() as conn:
+        conn.execute(ddl)
+
+
+@app.on_event("startup")
+def _startup_ensure_schema() -> None:
+    # 서버 기동 시 1회 실행. DDL 오류는 그대로 띄워 조기에 인지하도록 한다.
+    ensure_report_schema()
+
+
 class RouteRequest(BaseModel):
     start_lat: float
     start_lng: float
